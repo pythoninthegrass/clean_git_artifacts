@@ -28,9 +28,30 @@ bash clean_git_artifacts.sh
 # run zig binary (dry-run, default ~/git)
 ./cga
 
-# benchmark bash vs. zig
+# benchmark bash vs. zig vs. mojo
 task bench
 ```
+
+## Mojo implementation
+
+`spike_mojo/cga_mojo.mojo` is a hardened, full-parity Mojo port (same
+flags, matching rules, sizing, output, delete path, and shared size cache
+as the bash/zig implementations — see `task-001` in `backlog/` and the
+"Mojo implementation" section of `AGENTS.md` for the full verification and
+benchmark writeup). It builds and benches via `task build:mojo` / `task
+bench`, but **it is not a permanently maintained third implementation** —
+it's kept as a working, parity-verified reference, not part of the
+bash/zig keep-in-sync contract.
+
+Its discovery walk fans out recursively via nested `parallelize` calls
+(matching Zig's thread-pool-fanned walk), and its sizing pass reads each
+directory entry's file-type byte straight from a raw `opendir`/`readdir`
+FFI call (`list_dir_typed()`) instead of stat()-ing every file to learn its
+type, mirroring an optimization Mojo's own stdlib makes internally but
+doesn't expose. With both in place it benchmarks ~1.06-1.10x slower than
+the Zig binary and ~1.3-1.4x faster than bash in this environment — close
+to parity with Zig, a large improvement over the original ~1.6-1.9x gap and
+the ~2.6x gap before that.
 
 ## Benchmarking notes
 
