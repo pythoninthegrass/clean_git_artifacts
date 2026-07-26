@@ -9,8 +9,11 @@ dotenv: ['.env']
 
 vars:
   BIN: cga
-  ZIG_SRC: clean_git_artifacts.zig
   SH_SRC: clean_git_artifacts.sh
+  ZIG_SRC: clean_git_artifacts.zig
+  MOJO_SRC: spike_mojo/cga_mojo.mojo
+  ZIG_BIN: bin/zig/{{.BIN}}
+  MOJO_BIN: bin/mojo/{{.BIN}}
 
 tasks:
   default:
@@ -18,25 +21,53 @@ tasks:
     cmds:
       - task --list
 
-  build:
-    desc: Compile the Zig implementation to ./cga
+  _build:
+    internal: true
+    desc: "Compile OUT via CMD, creating its parent dir first (shared by build:*)"
     cmds:
-      - zig build-exe -O ReleaseFast -target aarch64-macos -lc -femit-bin={{.BIN}} {{.ZIG_SRC}}
+      - mkdir -p "$(dirname {{.OUT}})"
+      - "{{.CMD}}"
+
+  build:
+    desc: "Build all implementations (zig, mojo)"
+    cmds:
+      - task: build:zig
+      - task: build:mojo
+
+  build:zig:
+    desc: "Compile the Zig implementation to ./bin/zig/cga"
+    cmds:
+      - task: _build
+        vars:
+          OUT: "{{.ZIG_BIN}}"
+          CMD: "zig build-exe -O ReleaseFast -target aarch64-macos -lc -femit-bin={{.ZIG_BIN}} {{.ZIG_SRC}}"
     generates:
-      - "{{.BIN}}"
+      - "{{.ZIG_BIN}}"
     sources:
       - "{{.ZIG_SRC}}"
 
-  bench:
-    desc: Benchmark the bash script against the built Zig binary
-    deps:
-      - build
+  build:mojo:
+    desc: "Compile the Mojo spike to ./bin/mojo/cga"
     cmds:
-      - hyperfine --warmup 1 -n bash "bash {{.SH_SRC}}" -n zig "./{{.BIN}}"
+      - task: _build
+        vars:
+          OUT: "{{.MOJO_BIN}}"
+          CMD: "mojo build {{.MOJO_SRC}} -o {{.MOJO_BIN}}"
+    generates:
+      - "{{.MOJO_BIN}}"
+    sources:
+      - "{{.MOJO_SRC}}"
+
+  bench:
+    desc: "Benchmark the bash script against the built Zig and Mojo binaries"
+    cmds:
+      - task: build:zig
+      - task: build:mojo
+      - hyperfine --warmup 1 -n bash "bash {{.SH_SRC}}" -n zig "./{{.ZIG_BIN}}" -n mojo "./{{.MOJO_BIN}}"
 
   clean:
-    desc: Remove build artifacts
+    desc: "Remove build artifacts"
     status:
-      - test ! -f "{{.BIN}}"
+      - test ! -d bin
     cmds:
-      - rm -f "{{.BIN}}" "{{.BIN}}.o"
+      - rm -rf bin
