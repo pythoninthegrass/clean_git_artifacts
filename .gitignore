@@ -6,6 +6,7 @@ zig-cache/
 *.o
 cga
 CLAUDE.md
+.env
 
 # General
 .DS_Store

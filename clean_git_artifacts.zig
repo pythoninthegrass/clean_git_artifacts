@@ -10,6 +10,7 @@ const match_names = [_][]const u8{ "target", "node_modules", ".venv", "venv" };
 const Match = struct {
     path: []const u8, // absolute path, owned
     size_kb: u64 = 0,
+    mtime_sec: i64 = 0,
 };
 
 const Options = struct {
@@ -29,6 +30,9 @@ fn printUsage(prog: []const u8) void {
         \\  -n, --dry-run         Show what would be deleted without deleting (default)
         \\  -d, --delete          Actually delete matched directories
         \\  -h, --help            Show this help message
+        \\
+        \\Environment:
+        \\  NO_CACHE=true         Bypass the size cache; always du fresh
         \\
         \\Examples:
         \\  {s}                 # dry-run under ~/git
@@ -197,6 +201,68 @@ fn truncatePath(buf: []u8, path: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "...{s}", .{path[start..]}) catch path;
 }
 
+const CacheEntry = struct {
+    mtime_sec: i64,
+    size_kb: u64,
+    cached_at: i64, // when this entry was last computed via a real du, not last hit
+};
+
+// A cache hit still expires after this long even if the directory's mtime
+// hasn't changed, to bound the blind spot below: a build tool overwriting
+// an existing file in place changes size without touching the parent
+// directory's mtime, so the mtime check alone can't catch it.
+const cache_ttl_sec: i64 = 5 * 60;
+
+// Opportunistic size cache, keyed by matched directory path and its own
+// mtime, shared on disk between this binary and clean_git_artifacts.sh
+// (same TSV path and format). NOT a correctness guarantee even with the
+// TTL above -- see cache_ttl_sec. Set NO_CACHE=true to bypass entirely for
+// an accurate one-off measurement.
+fn cacheFilePath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    if (std.posix.getenv("XDG_CACHE_HOME")) |cache_home| {
+        return std.fs.path.join(allocator, &.{ cache_home, "clean_git_artifacts", "cache.tsv" });
+    }
+    return std.fs.path.join(allocator, &.{ home, ".cache", "clean_git_artifacts", "cache.tsv" });
+}
+
+fn loadCache(allocator: std.mem.Allocator, path: []const u8) std.StringHashMap(CacheEntry) {
+    var map = std.StringHashMap(CacheEntry).init(allocator);
+    const file = std.fs.openFileAbsolute(path, .{}) catch return map;
+    defer file.close();
+    const contents = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return map;
+    defer allocator.free(contents);
+
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const cpath = fields.next() orelse continue;
+        const mtime_str = fields.next() orelse continue;
+        const size_str = fields.next() orelse continue;
+        const cached_at_str = fields.next() orelse continue;
+        const mtime_sec = std.fmt.parseInt(i64, mtime_str, 10) catch continue;
+        const size_kb = std.fmt.parseInt(u64, size_str, 10) catch continue;
+        const cached_at = std.fmt.parseInt(i64, cached_at_str, 10) catch continue;
+        const owned_path = allocator.dupe(u8, cpath) catch continue;
+        map.put(owned_path, .{ .mtime_sec = mtime_sec, .size_kb = size_kb, .cached_at = cached_at }) catch allocator.free(owned_path);
+    }
+    return map;
+}
+
+fn saveCache(path: []const u8, map: *std.StringHashMap(CacheEntry)) !void {
+    const dir = std.fs.path.dirname(path) orelse return error.InvalidCachePath;
+    try std.fs.cwd().makePath(dir);
+    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    var buf_writer = std.io.bufferedWriter(file.writer());
+    const writer = buf_writer.writer();
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        try writer.print("{s}\t{d}\t{d}\t{d}\n", .{ entry.key_ptr.*, entry.value_ptr.mtime_sec, entry.value_ptr.size_kb, entry.value_ptr.cached_at });
+    }
+    try buf_writer.flush();
+}
+
 pub fn main() void {
     run() catch |err| {
         // Piping into `head`/`less` and quitting early closes stdout, which
@@ -289,12 +355,55 @@ fn run() !void {
     }, root_dup, 0 });
     pool.waitAndWork(&walk_wg);
 
-    // Sizing: one task per matched dir, in parallel.
-    var size_wg = std.Thread.WaitGroup{};
+    const no_cache = if (std.posix.getenv("NO_CACHE")) |v| std.mem.eql(u8, v, "true") else false;
+    const cache_path = try cacheFilePath(allocator, home);
+    defer allocator.free(cache_path);
+
+    var cache = if (no_cache) std.StringHashMap(CacheEntry).init(allocator) else loadCache(allocator, cache_path);
+    defer {
+        var it = cache.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        cache.deinit();
+    }
+
+    // Check each match's own mtime (and the cache entry's age) against the
+    // cache before sizing: an unchanged mtime within the TTL skips the
+    // recursive du-equivalent walk entirely.
+    const now = std.time.timestamp();
+    var needs_compute = std.ArrayList(*Match).init(allocator);
+    defer needs_compute.deinit();
+
     for (matches.items) |*m| {
+        const st = statAbsolute(m.path) catch null;
+        if (st) |s| {
+            m.mtime_sec = s.mtimespec.sec;
+            if (!no_cache) {
+                if (cache.get(m.path)) |cached| {
+                    if (cached.mtime_sec == m.mtime_sec and now - cached.cached_at < cache_ttl_sec) {
+                        m.size_kb = cached.size_kb;
+                        continue;
+                    }
+                }
+            }
+        }
+        try needs_compute.append(m);
+    }
+
+    // Sizing: one task per uncached matched dir, in parallel.
+    var size_wg = std.Thread.WaitGroup{};
+    for (needs_compute.items) |m| {
         pool.spawnWg(&size_wg, sizeWorker, .{SizeTask{ .allocator = allocator, .match = m }});
     }
     pool.waitAndWork(&size_wg);
+
+    if (!no_cache) {
+        for (needs_compute.items) |m| {
+            const owned_path = try allocator.dupe(u8, m.path);
+            const gop = try cache.getOrPut(owned_path);
+            if (gop.found_existing) allocator.free(owned_path);
+            gop.value_ptr.* = .{ .mtime_sec = m.mtime_sec, .size_kb = m.size_kb, .cached_at = now };
+        }
+    }
 
     std.sort.block(Match, matches.items, {}, matchLessDesc);
 
@@ -321,8 +430,15 @@ fn run() !void {
             std.fs.deleteTreeAbsolute(m.path) catch |err| {
                 std.debug.print("warning: failed to delete {s}: {s}\n", .{ m.path, @errorName(err) });
             };
+            if (!no_cache) {
+                if (cache.fetchRemove(m.path)) |kv| allocator.free(kv.key);
+            }
         }
     }
+
+    if (!no_cache) saveCache(cache_path, &cache) catch |err| {
+        std.debug.print("warning: failed to write cache {s}: {s}\n", .{ cache_path, @errorName(err) });
+    };
 
     var total_buf: [32]u8 = undefined;
     const total_human = try formatKb(&total_buf, total_kb);

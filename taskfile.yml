@@ -5,6 +5,8 @@ version: "3.0"
 set: ['e', 'u', 'pipefail']
 shopt: ['globstar']
 
+dotenv: ['.env']
+
 vars:
   BIN: cga
   ZIG_SRC: clean_git_artifacts.zig
