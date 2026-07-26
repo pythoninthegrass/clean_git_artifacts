@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: "3.0"
+
+set: ['e', 'u', 'pipefail']
+shopt: ['globstar']
+
+vars:
+  BIN: cga
+  ZIG_SRC: clean_git_artifacts.zig
+  SH_SRC: clean_git_artifacts.sh
+
+tasks:
+  default:
+    desc: "Default task"
+    cmds:
+      - task --list
+
+  build:
+    desc: Compile the Zig implementation to ./cga
+    cmds:
+      - zig build-exe -O ReleaseFast -target aarch64-macos -lc -femit-bin={{.BIN}} {{.ZIG_SRC}}
+    generates:
+      - "{{.BIN}}"
+    sources:
+      - "{{.ZIG_SRC}}"
+
+  bench:
+    desc: Benchmark the bash script against the built Zig binary
+    deps:
+      - build
+    cmds:
+      - hyperfine --warmup 1 -n bash "bash {{.SH_SRC}}" -n zig "./{{.BIN}}"
+
+  clean:
+    desc: Remove build artifacts
+    status:
+      - test ! -f "{{.BIN}}"
+    cmds:
+      - rm -f "{{.BIN}}" "{{.BIN}}.o"
